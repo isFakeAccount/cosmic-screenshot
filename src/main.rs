@@ -1,6 +1,11 @@
 use ashpd::desktop::screenshot::Screenshot;
-use clap::{ArgAction, Parser, command};
-use std::{collections::HashMap, fs, os::unix::fs::MetadataExt, path::PathBuf};
+use clap::{ArgAction, Parser};
+use std::{
+    collections::HashMap,
+    fs::{self},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 use zbus::{Connection, proxy, zvariant::Value};
 
 mod localize;
@@ -54,16 +59,37 @@ trait Notifications {
     ) -> zbus::Result<u32>;
 }
 
+fn move_picture(src_file: &Path, dst_file: &Path) {
+    let src_meta = fs::metadata(src_file)
+        .expect("Failed to get metadata on filesystem for picture source path.");
+
+    let dst_dir = dst_file
+        .parent()
+        .expect("Failed to get parent directory of destination path.");
+    let dst_meta = fs::metadata(dst_dir)
+        .expect("Failed to get metadata on filesystem for picture destination.");
+
+    if src_meta.dev() != dst_meta.dev() {
+        fs::rename(src_file, dst_file).expect("Failed to move screenshot.");
+        return;
+    }
+
+    fs::copy(src_file, dst_file).expect("Failed to move screenshot.");
+    fs::remove_file(src_file).expect("Failed to remove temporary screenshot.");
+}
+
 //TODO: better error handling
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     crate::localize::localize();
 
     let args = Args::parse();
-    let picture_dir = (!args.interactive).then(|| {
-        args.save_dir
-            .filter(|dir| dir.is_dir())
-            .unwrap_or_else(|| dirs::picture_dir().expect("failed to locate picture directory"))
+    let save_dir = (!args.interactive).then(|| {
+        args.save_dir.filter(|dir| dir.is_dir()).unwrap_or_else(|| {
+            let screenshot_dir = dirs::picture_dir().expect("failed to locate picture directory").join("Screenshots");
+            fs::create_dir_all(&screenshot_dir).expect("Failed to create Screenshots dir.");
+            screenshot_dir
+        })
     });
 
     let response = Screenshot::request()
@@ -91,32 +117,36 @@ async fn main() {
         "file" => {
             let response_path = uri
                 .to_file_path()
-                .unwrap_or_else(|_| panic!("unsupported response URI '{uri}'"));
-            if let Some(picture_dir) = picture_dir {
-                let date = chrono::Local::now();
-                let filename = format!("Screenshot_{}.png", date.format("%Y-%m-%d_%H-%M-%S"));
-                let path = picture_dir.join(filename);
-                if fs::metadata(&picture_dir)
-                    .expect("Failed to get medatata on filesystem for screenshot destination")
-                    .dev()
-                    != fs::metadata(&response_path)
-                        .expect("Failed to get metadata on filesystem for temporary path")
-                        .dev()
-                {
-                    // copy file instead
-                    fs::copy(&response_path, &path).expect("failed to move screenshot");
-                    fs::remove_file(&response_path).expect("failed to remove temporary screenshot");
-                } else {
-                    fs::rename(&response_path, &path).expect("failed to move screenshot");
-                }
+                .unwrap_or_else(|()| panic!("unsupported response URI '{uri}'"));
 
-                path.to_string_lossy().to_string()
+            let date = chrono::Local::now();
+            let filename = format!("Screenshot_{}.png", date.format("%Y-%m-%d_%H-%M-%S"));
+
+            let pictures_dir = dirs::picture_dir().expect("Failed to locate Pictures directory.");
+            let documents_dir =
+                dirs::document_dir().expect("Failed to locate Documents directory.");
+
+            let target_dir = if let Some(save_dir) = save_dir {
+                save_dir
+            } else if response_path.starts_with(&pictures_dir) {
+                dirs::picture_dir()
+                    .expect("Failed to locate picture directory.")
+                    .join("Screenshots")
+            } else if response_path.starts_with(&documents_dir) {
+                dirs::document_dir().expect("Failed to locate document directory.")
             } else {
-                response_path.to_string_lossy().to_string()
-            }
+                response_path.clone()
+            };
+
+            fs::create_dir_all(&target_dir).unwrap_or_else(|_| {
+                panic!("Failed to create directory '{}'", target_dir.display())
+            });
+            let target_img_path = target_dir.join(filename);
+            move_picture(&response_path, &target_img_path);
+            target_img_path.to_string_lossy().to_string()
         }
         "clipboard" => String::new(),
-        scheme => panic!("unsupported scheme '{}'", scheme),
+        scheme => panic!("unsupported scheme '{scheme}'"),
     };
 
     println!("{path}");
